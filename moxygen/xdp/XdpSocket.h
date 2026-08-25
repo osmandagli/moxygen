@@ -8,13 +8,18 @@
 
 namespace moxygen {
 
+struct XdpState; // forward declaration 
+
 class XdpSocket : public folly::AsyncUDPSocket {
   public:
     XdpSocket(const XdpSocket&) = delete;
     XdpSocket& operator=(const XdpSocket&) = delete;
 
     explicit XdpSocket(folly::EventBase*);
-    virtual ~XdpSocket() = default;
+    ~XdpSocket() override;
+  private:
+    std::unique_ptr<XdpState> xdp_;
+    bool ownsXsk = false;
 };
 
 class XdpSocketFactory : public quic::QuicUDPSocketFactory {
@@ -31,6 +36,8 @@ class XdpSocketFactory : public quic::QuicUDPSocketFactory {
             folly::NetworkSocket::fromFd(fd),
             quic::FollyAsyncUDPSocketAlias::FDOwnership::SHARED);
         sock->setDFAndTurnOffPMTU();
+      } else {
+        ownsXsk = true;
       }
       return sock;
     }
