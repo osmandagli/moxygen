@@ -88,6 +88,8 @@ add_compile_definitions(
 )
 find_package(gflags REQUIRED)
 find_package(Zstd REQUIRED)
+find_package(LibBpf REQUIRED)
+find_package(LibXdp REQUIRED)
 
 # Define BUILD_SAMPLES after find_package calls so it doesn't affect
 # proxygen's BUILD_SAMPLES option during config

@@ -17,6 +17,7 @@
 #include <quic/common/address/QuicSocketAddressBridge.h>
 #include <moxygen/MoQTypes.h>
 #include <moxygen/events/MoQFollyExecutorImpl.h>
+#include "moxygen/xdp/XdpSocket.h"
 
 #include <utility>
 
@@ -124,6 +125,12 @@ MoQServer::MoQServer(
 
   hqServer_ =
       std::make_unique<HQServer>(params_, std::move(factory_), fizzContext_);
+  
+  auto listenerFactory = std::make_unique<XdpSocketFactory>();
+  auto connFactory = std::make_unique<XdpSocketFactory>();
+
+  hqServer_->setQuicUDPSocketFactories(std::move(listenerFactory), std::move(connFactory));
+
 }
 
 void MoQServer::registerAlpnHandler(const std::vector<std::string>& alpns) {
