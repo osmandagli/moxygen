@@ -151,6 +151,7 @@ moxygen_add_library(moxygen_moq_server
   SRCS
     MoQServer.cpp
   DEPS
+    moxygen_xdp
     moxygen_events_moq_folly_executor_impl
     moxygen_moq_types
     moxygen_moq_versions
@@ -355,6 +356,7 @@ add_subdirectory(msf)
 add_subdirectory(proxy)
 add_subdirectory(stats)
 add_subdirectory(util)
+add_subdirectory(xdp)
 
 add_subdirectory(relay)
 
