@@ -1,9 +1,10 @@
 {
-    "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
+    // Real IntelliSense engine (semantic parse). "Tag Parser" is a fuzzy text
+    // index: no error squiggles, and `->` completion guesses by name, not type.
+    "C_Cpp.intelliSenseEngine": "default",
     "C_Cpp.default.compilerPath": "/usr/bin/g++-13",
-    "C_Cpp.intelliSenseEngine": "Tag Parser",
+    "C_Cpp.default.cppStandard": "c++20",
     "C_Cpp.clang_format_style": "{ BasedOnStyle: Google, BreakBeforeBraces: Attach }",
-    
 
     "cmake.configureOnOpen": false,
     "cmake.configureOnEdit": false,
@@ -11,6 +12,8 @@
     "cmake.buildBeforeRun": false,
     "cmake.buildTask": false,
     "cmake.deleteBuildDirOnCleanConfigure": false,
+    "cmake.sourceDirectory": "${workspaceFolder}/standalone",
+    "cmake.buildDirectory": "${workspaceFolder}/_build",
     "testMate.cpp.test.executables": "{build,Build,BUILD,out,Out,OUT,moxygen}/**/*{test,Test,TEST}*",
     "files.associations": {
         "chrono": "cpp"
