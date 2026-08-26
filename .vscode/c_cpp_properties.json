@@ -2,19 +2,26 @@
     "configurations": [
         {
             "name": "WSL2",
+            // Fallback only. Once _build/compile_commands.json exists it takes
+            // priority and describes the real flags per file.
+            "compileCommands": "${workspaceFolder}/_build/compile_commands.json",
             "includePath": [
-                "${workspaceFolder}/**",
-                "${workspaceFolder}/_build/deps/**"
+                "${workspaceFolder}",
+                "${workspaceFolder}/_build/_deps/**",
+                "/WORKSPACE/folly",
+                "/WORKSPACE/mvfst",
+                "/WORKSPACE/proxygen",
+                "/WORKSPACE/xdp-tutorial/lib/xdp-tools/headers"
             ],
             "defines": [
                 "_DEBUG",
                 "__linux__",
                 "__x86_64__"
             ],
-            "compilerPath": "/usr/bin/gcc",
+            "compilerPath": "/usr/bin/g++-13",
             "cStandard": "c17",
-            "cppStandard": "gnu++17",
-            "intelliSenseMode": "${default}"
+            "cppStandard": "c++20",
+            "intelliSenseMode": "linux-gcc-x64"
         }
     ],
     "version": 4
