@@ -8,18 +8,18 @@
 
 namespace moxygen {
 
-struct XdpState; // forward declaration 
+struct xsk_socket_info; // forward declaration 
 
 class XdpSocket : public folly::AsyncUDPSocket {
   public:
     XdpSocket(const XdpSocket&) = delete;
     XdpSocket& operator=(const XdpSocket&) = delete;
 
-    explicit XdpSocket(folly::EventBase*);
+    explicit XdpSocket(folly::EventBase*, bool ownsXsk);
     ~XdpSocket() override;
   private:
-    std::unique_ptr<XdpState> xdp_;
-    bool ownsXsk = false;
+    std::unique_ptr<xsk_socket_info> xdp_;
+    bool ownsXsk_;
 };
 
 class XdpSocketFactory : public quic::QuicUDPSocketFactory {
@@ -30,14 +30,12 @@ class XdpSocketFactory : public quic::QuicUDPSocketFactory {
     
     std::unique_ptr<quic::FollyAsyncUDPSocketAlias> make(folly::EventBase* evb, int fd)
         override {
-      auto sock = std::make_unique<XdpSocket>(evb);
+      auto sock = std::make_unique<XdpSocket>(evb, fd == -1); // listener owns the socket
       if (fd != -1) {
         sock->setFD(
             folly::NetworkSocket::fromFd(fd),
             quic::FollyAsyncUDPSocketAlias::FDOwnership::SHARED);
         sock->setDFAndTurnOffPMTU();
-      } else {
-        ownsXsk = true;
       }
       return sock;
     }
