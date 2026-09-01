@@ -1,6 +1,7 @@
 #include "moxygen/xdp/XdpSocket.h"
 #include <folly/io/async/EventBase.h>
 #include <folly/io/async/AsyncUDPSocket.h>
+#include <folly/net/NetOps.h>
 
 #include <memory>
 #include <vector>
@@ -10,9 +11,17 @@
 #include <cstdio>
 #include <cstring>
 #include <cerrno>
+#include <algorithm>
 
 #include <bpf/libbpf.h>
 #include <xdp/xsk.h>
+#include <net/if.h>
+#include <linux/if_link.h>
+#include <linux/if_ether.h> 
+#include <netinet/in.h>     
+#include <netinet/ip.h>     
+#include <netinet/udp.h> 
+#include <sys/socket.h>
 
 #define NUM_FRAMES  4096
 #define FRAME_SIZE  XSK_UMEM__DEFAULT_FRAME_SIZE
@@ -44,10 +53,20 @@ struct xsk_socket_info {
   std::vector<uint64_t> umem_frame_addr; // Unused UMEM frames
 
   int queueId = -1;
+	int ifindex = -1;
+	bpf_object* obj = nullptr;
+
 	~xsk_socket_info() {
+		if (ifindex > 0) bpf_xdp_detach(ifindex, XDP_FLAGS_SKB_MODE, NULL);
 		if (xsk) xsk_socket__delete(xsk);
+		if (obj) bpf_object__close(obj);
 		delete umem;
 	}
+};
+
+struct _vlan_hdr {
+  __be16 h_vlan_TCI;
+  __be16 h_vlan_encapsulated_proto;
 };
 
 namespace {
@@ -68,6 +87,10 @@ xsk_umem_info *configure_xsk_umem(void *buffer, uint64_t size)
 
 	return umem;
 }
+
+void     xsk_free_umem_frame(xsk_socket_info* xsk, uint64_t addr) { xsk->umem_frame_addr.push_back(addr); }
+
+uint64_t xsk_umem_free_frames(xsk_socket_info* xsk) { return xsk->umem_frame_addr.size(); }
 
 uint64_t xsk_alloc_umem_frame(xsk_socket_info *xsk)
 {
@@ -121,14 +144,15 @@ bool xsk_configure_socket(xsk_socket_info* xsk_info, const char* ifname, int que
 	// Submit the filled slots to the kernel to process them
 	xsk_ring_prod__submit(&xsk_info->umem->fq, XSK_RING_PROD__DEFAULT_NUM_DESCS);
   
-	return true;
+	return 0;
 
 errno_exit:
 	errno = -ret;
-	return false;
+	return 1;
 }
 
-}
+
+} // anonymous namespace
 
 // XdpSocket::~XdpSocket() {
 //   xsk_socket__delete(xdp_->xsk);
@@ -151,7 +175,8 @@ XdpSocket::XdpSocket(folly::EventBase* evb, bool ownsXsk) : folly::AsyncUDPSocke
 
   if (!ownsXsk_) return; // If doesn't own the socket don't create UMEM
 
-	bool ret;
+	int ret;
+	int map_fd;
   void *packet_buffer;
 	uint64_t packet_buffer_size;
 
@@ -174,12 +199,155 @@ XdpSocket::XdpSocket(folly::EventBase* evb, bool ownsXsk) : folly::AsyncUDPSocke
 	}
 
 	ret = xsk_configure_socket(xdp_.get(), "veth0", 0);
-	if (!ret) {
+	if (ret) {
 		fprintf(stderr, "ERROR: Can't create socket \"%s\"\n",
 			strerror(errno));
 		throw std::runtime_error("ERROR: Can't create socket");
 	}
+
+	int ifindex = if_nametoindex("veth0");
+	if (ifindex == 0) {
+		fprintf(stderr, "ERROR: Can't find the interface \"%s\"\n",
+			strerror(errno));
+		throw std::runtime_error("ERROR: Can't find the interface");
+	}
+	xdp_->ifindex = ifindex;
+
+	bpf_object* obj = bpf_object__open_file("/local/moxygen_build/repos/github.com-facebookexperimental-moxygen.git/moxygen/xdp/XdpKernel.bpf.o", NULL);
+	if (obj == NULL) {
+		fprintf(stderr, "ERROR: Can't open bpf object \"%s\"\n",
+			strerror(errno));
+		throw std::runtime_error("ERROR: Can't open bpf object");
+	}
+	xdp_->obj = obj;
   
+	ret = bpf_object__load(obj);
+	if (ret) {
+		fprintf(stderr, "ERROR: Can't load bpf object \"%s\"\n",
+			strerror(errno));
+		throw std::runtime_error("ERROR: Can't load bpf object");
+	}
+
+	bpf_program* prog = bpf_object__find_program_by_name(obj, "xdp_sock_prog");
+	if (prog == NULL) {
+		fprintf(stderr, "ERROR: Can't find ebpf prog \"%s\"\n",
+			strerror(errno));
+		throw std::runtime_error("ERROR: Can't find ebpf prog");
+	}
+
+	ret = bpf_xdp_attach(ifindex, bpf_program__fd(prog), XDP_FLAGS_SKB_MODE, NULL);
+	if (ret) {
+		fprintf(stderr, "ERROR: Can't attach ebpf prog \"%s\"\n",
+			strerror(errno));
+		throw std::runtime_error("ERROR: Can't attach ebpf prog");
+	}
+
+	map_fd = bpf_object__find_map_fd_by_name(obj, "xsks_map");
+	if (map_fd < 0) {
+		fprintf(stderr, "ERROR: Unvalid map_fd \"%s\"\n",
+			strerror(errno));
+		throw std::runtime_error("ERROR: Unvalid map_fd");
+	}
+
+	ret = xsk_socket__update_xskmap(xdp_->xsk, map_fd);
+	if (ret) {
+		fprintf(stderr, "ERROR: Can't update xskmap \"%s\"\n",
+			strerror(errno));
+		throw std::runtime_error("ERROR: Can't update xskmap");
+	}
+
+}
+
+int XdpSocket::recvmmsg(struct mmsghdr* msgvec, unsigned int vlen, unsigned int flags, struct timespec* timeout) {
+	
+	if (!ownsXsk_)
+		return folly::AsyncUDPSocket::recvmmsg(msgvec, vlen, flags, timeout);
+	
+	unsigned rcvd;
+	uint32_t idx_rx = 0, idx_fq = 0;
+	size_t nh_off;
+	__u16 h_proto;
+
+	rcvd = xsk_ring_cons__peek(&xdp_->rx, vlen, &idx_rx);
+	if (!rcvd) {
+		errno = EAGAIN; // mvfst treats as "try later"
+		return -1;
+	}
+	
+	for (unsigned i = 0; i < rcvd; i++) {
+		const struct xdp_desc* d = xsk_ring_cons__rx_desc(&xdp_->rx, idx_rx + i);
+		uint8_t* pkt = (uint8_t*)xsk_umem__get_data(xdp_->umem->buffer, d->addr);
+
+		// recycle the frame
+		xsk_free_umem_frame(xdp_.get(), d->addr);
+		
+		struct ethhdr *eth = (struct ethhdr *) pkt;
+		nh_off = ETH_HLEN;
+		h_proto = eth->h_proto;
+		if (h_proto == htons(ETH_P_8021Q) || h_proto == htons(ETH_P_8021AD)) {
+  	  struct _vlan_hdr *vhdr;
+  	  vhdr = (struct _vlan_hdr *)(pkt + nh_off);
+  	  nh_off += sizeof(struct _vlan_hdr);
+  	  h_proto = vhdr->h_vlan_encapsulated_proto;
+  	}
+		struct iphdr *iph = (struct iphdr *) (pkt + nh_off);
+		nh_off += iph->ihl * 4;
+		struct udphdr *udp = (struct udphdr *) (pkt + nh_off);
+		nh_off += sizeof(udphdr);
+
+		if (d->len < nh_off) {
+			msgvec[i].msg_len = 0;
+			continue;
+		}
+
+		uint8_t* payload = pkt + nh_off;
+		size_t payload_len = d->len - nh_off;
+
+		auto& mh = msgvec[i].msg_hdr;
+		size_t cap = mh.msg_iov[0].iov_len;
+		size_t n = std::min(payload_len, cap);
+		memcpy(mh.msg_iov[0].iov_base, payload, n);
+		msgvec[i].msg_len = n;
+
+		if (mh.msg_name && mh.msg_namelen >= sizeof(sockaddr_in)) {
+  	  auto* sin = (struct sockaddr_in*)mh.msg_name;
+  	  sin->sin_family = AF_INET;
+  	  sin->sin_addr.s_addr = iph->saddr;   // already network order
+  	  sin->sin_port = udp->source;         // already network order
+  	  mh.msg_namelen = sizeof(sockaddr_in);
+  	}
+  	mh.msg_controllen = 0;   // no GRO/cmsg for the first cut
+  	mh.msg_flags = 0;
+	}
+
+	xsk_ring_cons__release(&xdp_->rx, rcvd);
+	unsigned nfree = xsk_umem_free_frames(xdp_.get());
+	unsigned room = xsk_prod_nb_free(&xdp_->umem->fq, nfree);
+	unsigned stock = std::min(room, nfree);
+	if (stock > 0) {
+		xsk_ring_prod__reserve(&xdp_->umem->fq, stock, &idx_fq);
+		for (unsigned j = 0; j < stock; j++)
+      *xsk_ring_prod__fill_addr(&xdp_->umem->fq, idx_fq + j) = xsk_alloc_umem_frame(xdp_.get());
+    xsk_ring_prod__submit(&xdp_->umem->fq, stock);
+	}
+	if (xsk_ring_prod__needs_wakeup(&xdp_->umem->fq))
+    recvfrom(xsk_socket__fd(xdp_->xsk), NULL, 0, MSG_DONTWAIT, NULL, NULL);
+	
+	return rcvd;
+}
+
+void XdpSocket::resumeRead(folly::AsyncUDPSocket::ReadCallback* cob) {
+	// Base installs readCallback_ and registers the handler on the kernel fd_
+	folly::AsyncUDPSocket::resumeRead(cob);
+
+	if (!ownsXsk_) return;
+
+	unregisterHandler();
+	changeHandlerFD(folly::NetworkSocket(xsk_socket__fd(xdp_->xsk)));
+	bool is_registered = registerHandler(folly::EventHandler::READ | folly::EventHandler::PERSIST);
+	if (!is_registered) {
+		XLOG(WARNING) << "Can't register the new handler";
+	}
 }
 
 }
