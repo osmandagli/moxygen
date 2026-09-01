@@ -15,6 +15,11 @@ class XdpSocket : public folly::AsyncUDPSocket {
     XdpSocket(const XdpSocket&) = delete;
     XdpSocket& operator=(const XdpSocket&) = delete;
 
+    int recvmmsg(struct mmsghdr* msgvec, unsigned int vlen,
+               unsigned int flags, struct timespec* timeout) override;
+    
+    void resumeRead(folly::AsyncUDPSocket::ReadCallback* cob) override;
+
     explicit XdpSocket(folly::EventBase*, bool ownsXsk);
     ~XdpSocket() override;
   private:
