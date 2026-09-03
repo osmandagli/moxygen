@@ -1,4 +1,3 @@
-#include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
 #include <linux/bpf.h>
@@ -7,6 +6,8 @@
 #include <linux/udp.h>
 #include <linux/ipv6.h>
 #include <linux/in.h>
+
+#include <bpf/bpf_helpers.h>
 
 struct {
 	__uint(type, BPF_MAP_TYPE_XSKMAP);

@@ -6,8 +6,9 @@ moxygen_add_library(moxygen_xdp
   SRCS
     XdpSocket.cpp
   DEPS
-    libbpf
     libxdp
+    libbpf
+    
   EXPORTED_DEPS
     mvfst::mvfst_server_server
     Folly::folly_io_async_async_udp_socket
