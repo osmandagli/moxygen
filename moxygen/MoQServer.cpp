@@ -90,6 +90,7 @@ MoQServer::MoQServer(
   params_.transportSettings = options.transportSettings
       ? *options.transportSettings
       : defaultTransportSettings();
+  params_.transportSettings.shouldUseWrapperRecvmmsgForBatchRecv = true;
 
   // UDP socket buffer sizes
   params_.udpSendBufferSize = options.udpSendBufferBytes > 0
