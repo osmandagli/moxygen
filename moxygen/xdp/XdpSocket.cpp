@@ -348,6 +348,16 @@ void XdpSocket::resumeRead(folly::AsyncUDPSocket::ReadCallback* cob) {
 	if (!is_registered) {
 		XLOG(WARNING) << "Can't register the new handler";
 	}
+	getEventBase()->runAfterDelay([this] {
+      struct xdp_statistics st{};
+      socklen_t len = sizeof(st);
+      int fd = xsk_socket__fd(xdp_->xsk);
+      getsockopt(fd, SOL_XDP, XDP_STATISTICS, &st, &len);
+      XLOG(INFO) << "xsk rx_dropped=" << st.rx_dropped
+                 << " rx_invalid=" << st.rx_invalid_descs
+                 << " rx_ring_full=" << st.rx_ring_full
+                 << " rx_fill_empty=" << st.rx_fill_ring_empty_descs;
+  }, 3000);
 }
 
 }
