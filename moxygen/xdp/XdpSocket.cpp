@@ -2,6 +2,7 @@
 #include <folly/io/async/EventBase.h>
 #include <folly/io/async/AsyncUDPSocket.h>
 #include <folly/net/NetOps.h>
+#include <folly/container/F14Map.h>
 
 #include <memory>
 #include <vector>
@@ -55,6 +56,15 @@ struct xsk_socket_info {
   int queueId = -1;
 	int ifindex = -1;
 	bpf_object* obj = nullptr;
+
+	// L2 identity cache for TX (populated on RX)
+	uint8_t local_mac[6] = {0}; // eth->h_dest on RX eth src on TX
+	uint32_t local_ip = 0; 			// iph->daddr (net order) on RX ip src on TX
+	uint16_t local_port = 0;		// udp->dest (net order) on RX udp src on TX
+	bool l2_ready = false;
+
+	// per-peer next-hop MAC, keyed by peer IPv4 (net order). 
+	folly::F14FastMap<uint32_t, std::array<uint8_t, 6>> peer_macs;
 
 	~xsk_socket_info() {
 		if (ifindex > 0) bpf_xdp_detach(ifindex, XDP_FLAGS_SKB_MODE, NULL);
@@ -149,6 +159,27 @@ bool xsk_configure_socket(xsk_socket_info* xsk_info, const char* ifname, int que
 errno_exit:
 	errno = -ret;
 	return 1;
+}
+
+void complete_tx(xsk_socket_info* x) {
+	uint32_t idx_cq = 0;
+	unsigned completed = xsk_ring_cons__peek(&x->umem->cq, XSK_RING_CONS__DEFAULT_NUM_DESCS, &idx_cq);
+
+	if (!completed) return;
+
+	for (unsigned i = 0; i < completed; i++) {
+		xsk_free_umem_frame(x, *xsk_ring_cons__comp_addr(&x->umem->cq, idx_cq + i));
+	}
+	xsk_ring_cons__release(&x->umem->cq, completed);
+}
+
+uint16_t ipv4_checksum(const void* data, size_t len) {
+	const uint16_t* p = (const uint16_t*) data;
+	uint32_t sum = 0;
+	while (len > 1) { sum += *p++; len -= 2; } // add each 16-bit word into 32 bit sum
+	if (len == 1) sum += *(const uint8_t*)p; // trailing odd byte
+	while (sum >> 16) sum = (sum & 0xffff) + (sum >> 16); // fold carries
+	return (uint16_t)~sum; // one's complement; already in net order
 }
 
 
@@ -292,6 +323,17 @@ int XdpSocket::recvmmsg(struct mmsghdr* msgvec, unsigned int vlen, unsigned int 
 			continue;
 		}
 
+		std::array<uint8_t, 6> src;
+		memcpy(src.data(), eth->h_source, 6);
+		xdp_->peer_macs[iph->saddr] = src;
+
+		if (!xdp_->l2_ready) {
+			memcpy(xdp_->local_mac, eth->h_dest, 6);
+			xdp_->local_ip = iph->daddr;
+			xdp_->local_port = udp->dest;
+			xdp_->l2_ready = true;
+		}
+
 		uint8_t* payload = pkt + nh_off;
 		size_t payload_len = d->len - nh_off;
 
@@ -340,6 +382,96 @@ void XdpSocket::resumeRead(folly::AsyncUDPSocket::ReadCallback* cob) {
 	if (!is_registered) {
 		XLOG(WARNING) << "Can't register the new handler";
 	}
+}
+
+ssize_t XdpSocket::writev(const folly::SocketAddress& address, const struct iovec* vec, size_t iovec_len, folly::AsyncUDPSocket::WriteOptions options) {
+	xsk_socket_info* x = getXsk();
+	folly::IPAddress ip = address.getIPAddress();
+	if (ip.isIPv4Mapped()) {
+		ip = folly::IPAddress::createIPv4(ip);
+	}
+	// If something is not true fallback to old method
+	if (!x || !x->l2_ready || !ip.isV4() || iovec_len != 1) {
+		return folly::AsyncUDPSocket::writev(address, vec, iovec_len, options);
+	}
+
+	uint32_t peer_ip = ip.asV4().toLong();
+	auto it = x->peer_macs.find(peer_ip);
+	if (it == x->peer_macs.end()) { // never heard from this peer
+		return folly::AsyncUDPSocket::writev(address, vec, iovec_len, options);
+	}
+	const std::array<uint8_t, 6>& dst_mac = it->second;
+	uint16_t dst_port = htons(address.getPort());
+
+	size_t payload_len = 0;
+	for (size_t i = 0; i < iovec_len; i++) payload_len += vec[i].iov_len;
+	if (payload_len == 0) return 0;
+
+	size_t seg_size = options.gso > 0 ? (size_t)options.gso : payload_len;
+	size_t sent = 0;
+
+	for (size_t off = 0; off < payload_len; off += seg_size) {
+		// This is to make sure that the last one sized correctly
+		size_t seg_len = std::min(seg_size, payload_len - off);
+
+		uint64_t frame = xsk_alloc_umem_frame(x);
+		if (frame == INVALID_UMEM_FRAME) {
+			complete_tx(x); // reclaim finished TX frames, retry once
+			frame = xsk_alloc_umem_frame(x);
+			if (frame == INVALID_UMEM_FRAME) break; // still dry, stop
+		}
+		uint8_t* pkt = (uint8_t*)xsk_umem__get_data(x->umem->buffer, frame);
+    //   4. build eth/ip/udp headers into pkt   (dstMac, x->local_mac, peerIp, dstPort ...)
+		ssize_t hdr_len = 42; // 14 (eth) + 20 (ip) + 8 (udp)
+		// datagram must fit into FRAME SIZE (4096)
+		if (hdr_len + seg_len > FRAME_SIZE) { xsk_free_umem_frame(x, frame); break;}
+
+		struct ethhdr* eth = (struct ethhdr*) pkt;
+		memcpy(eth->h_dest, dst_mac.data(), 6); // peer, next hop
+		memcpy(eth->h_source, x->local_mac, 6); // us
+		eth->h_proto = htons(ETH_P_IP);
+
+		struct iphdr* iph = (struct iphdr*) (pkt + sizeof(*eth));
+		iph->version = 4;
+		iph->ihl = 5;
+		iph->tos = 0;
+		iph->tot_len = htons(sizeof(*iph) + sizeof(struct udphdr) + seg_len);
+		iph->id = 0;
+		iph->frag_off = 0;
+		iph->ttl = 64;
+		iph->protocol = IPPROTO_UDP;
+		iph->check = 0;
+		iph->saddr = x->local_ip;
+		iph->daddr = peer_ip;
+
+		struct udphdr* udp = (struct udphdr*) (pkt + sizeof(*eth) + sizeof(*iph));
+		udp->source = x->local_port;
+		udp->dest = dst_port;
+		udp->len = htons(sizeof(*udp) + seg_len);
+		udp->check = 0;
+
+		// copy the payload slice
+		memcpy(pkt + hdr_len, (const uint8_t*)vec[0].iov_base + off, seg_len);
+
+		iph->check = ipv4_checksum(iph, sizeof(*iph));
+    //   7. reserve TX desc: addr, len = 42 + segLen; submit
+		uint32_t tx_idx = 0;
+		if (xsk_ring_prod__reserve(&x->tx, 1, &tx_idx) != 1) {
+			xsk_free_umem_frame(x, frame); // couldn't queue stop
+			break;
+		}
+		struct xdp_desc* txd = xsk_ring_prod__tx_desc(&x->tx, tx_idx);
+		txd->addr = frame;
+		txd->len = hdr_len + seg_len;
+		xsk_ring_prod__submit(&x->tx, 1);
+		sent += seg_len;
+	}
+	// Stage 8 wakeup + Stage 9 completion drain, then:
+	if (xsk_ring_prod__needs_wakeup(&x->tx)) 
+			sendto(xsk_socket__fd(x->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+	complete_tx(x);
+	if (sent == 0) { errno = EAGAIN; return -1; }
+	return sent;
 }
 
 }
