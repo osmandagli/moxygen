@@ -127,8 +127,9 @@ MoQServer::MoQServer(
   hqServer_ =
       std::make_unique<HQServer>(params_, std::move(factory_), fizzContext_);
   
-  auto listenerFactory = std::make_unique<XdpSocketFactory>();
-  auto connFactory = std::make_unique<XdpSocketFactory>();
+  auto shared = std::make_shared<XskShared>();
+  auto listenerFactory = std::make_unique<XdpSocketFactory>(shared);
+  auto connFactory = std::make_unique<XdpSocketFactory>(shared);
 
   hqServer_->setQuicUDPSocketFactories(std::move(listenerFactory), std::move(connFactory));
 
