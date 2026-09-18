@@ -24,6 +24,7 @@
 #include <netinet/udp.h> 
 #include <sys/socket.h>
 
+#define RX_FRAME_FLOOR 512
 #define NUM_FRAMES  4096
 #define FRAME_SIZE  XSK_UMEM__DEFAULT_FRAME_SIZE
 #define INVALID_UMEM_FRAME UINT64_MAX
@@ -67,7 +68,7 @@ struct xsk_socket_info {
 	folly::F14FastMap<uint32_t, std::array<uint8_t, 6>> peer_macs;
 
 	~xsk_socket_info() {
-		if (ifindex > 0) bpf_xdp_detach(ifindex, XDP_FLAGS_SKB_MODE, NULL);
+		if (ifindex > 0) bpf_xdp_detach(ifindex, XDP_FLAGS_DRV_MODE, NULL);
 		if (xsk) xsk_socket__delete(xsk);
 		if (obj) bpf_object__close(obj);
 		delete umem;
@@ -125,7 +126,7 @@ bool xsk_configure_socket(xsk_socket_info* xsk_info, const char* ifname, int que
 	xsk_cfg.xdp_flags = 0;  
 	xsk_cfg.libxdp_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
 	// veth can't zc, change XDP_COPY to XDP_ZEROCOPY when using real interface
-	xsk_cfg.bind_flags = XDP_USE_NEED_WAKEUP | XDP_COPY;
+	xsk_cfg.bind_flags = XDP_USE_NEED_WAKEUP | XDP_ZEROCOPY;
 
 	xsk_info->queueId = queueId;
 
@@ -171,6 +172,26 @@ void complete_tx(xsk_socket_info* x) {
 		xsk_free_umem_frame(x, *xsk_ring_cons__comp_addr(&x->umem->cq, idx_cq + i));
 	}
 	xsk_ring_cons__release(&x->umem->cq, completed);
+}
+
+void complete_func(xsk_socket_info* x) {
+	uint32_t idx_fq = 0;
+
+	complete_tx(x);
+
+	unsigned nfree = xsk_umem_free_frames(x);
+	unsigned room = xsk_prod_nb_free(&x->umem->fq, nfree);
+	unsigned stock = std::min(room, nfree);
+	if (stock > 0) {
+		xsk_ring_prod__reserve(&x->umem->fq, stock, &idx_fq);
+		for (unsigned j = 0; j < stock; j++)
+      		*xsk_ring_prod__fill_addr(&x->umem->fq, idx_fq + j) = xsk_alloc_umem_frame(x);
+    xsk_ring_prod__submit(&x->umem->fq, stock);
+	}
+
+	if (xsk_ring_prod__needs_wakeup(&x->umem->fq))
+	//TODO add poll()
+    	recvfrom(xsk_socket__fd(x->xsk), NULL, 0, MSG_DONTWAIT, NULL, NULL);
 }
 
 uint16_t ipv4_checksum(const void* data, size_t len) {
@@ -221,14 +242,7 @@ XdpSocket::XdpSocket(folly::EventBase* evb, bool ownsXsk) : folly::AsyncUDPSocke
 		throw std::runtime_error("ERROR: Can't create umem");
 	}
 
-	ret = xsk_configure_socket(xdp_.get(), "veth0", 0);
-	if (ret) {
-		fprintf(stderr, "ERROR: Can't create socket \"%s\"\n",
-			strerror(errno));
-		throw std::runtime_error("ERROR: Can't create socket");
-	}
-
-	int ifindex = if_nametoindex("veth0");
+	int ifindex = if_nametoindex("eno12409np1");
 	if (ifindex == 0) {
 		fprintf(stderr, "ERROR: Can't find the interface \"%s\"\n",
 			strerror(errno));
@@ -258,7 +272,7 @@ XdpSocket::XdpSocket(folly::EventBase* evb, bool ownsXsk) : folly::AsyncUDPSocke
 		throw std::runtime_error("ERROR: Can't find ebpf prog");
 	}
 
-	ret = bpf_xdp_attach(ifindex, bpf_program__fd(prog), XDP_FLAGS_SKB_MODE, NULL);
+	ret = bpf_xdp_attach(ifindex, bpf_program__fd(prog), XDP_FLAGS_DRV_MODE, NULL);
 	if (ret) {
 		fprintf(stderr, "ERROR: Can't attach ebpf prog \"%s\"\n",
 			strerror(errno));
@@ -272,6 +286,13 @@ XdpSocket::XdpSocket(folly::EventBase* evb, bool ownsXsk) : folly::AsyncUDPSocke
 		throw std::runtime_error("ERROR: Unvalid map_fd");
 	}
 
+	ret = xsk_configure_socket(xdp_.get(), "eno12409np1", 2);
+	if (ret) {
+		fprintf(stderr, "ERROR: Can't create socket \"%s\"\n",
+			strerror(errno));
+		throw std::runtime_error("ERROR: Can't create socket");
+	}
+
 	ret = xsk_socket__update_xskmap(xdp_->xsk, map_fd);
 	if (ret) {
 		fprintf(stderr, "ERROR: Can't update xskmap \"%s\"\n",
@@ -279,22 +300,25 @@ XdpSocket::XdpSocket(folly::EventBase* evb, bool ownsXsk) : folly::AsyncUDPSocke
 		throw std::runtime_error("ERROR: Can't update xskmap");
 	}
 
+  complete_func(getXsk());
+
 }
 
 int XdpSocket::recvmmsg(struct mmsghdr* msgvec, unsigned int vlen, unsigned int flags, struct timespec* timeout) {
 	
 	if (!ownsXsk_)
 		return folly::AsyncUDPSocket::recvmmsg(msgvec, vlen, flags, timeout);
-	
+
 	unsigned rcvd;
-	uint32_t idx_rx = 0, idx_fq = 0;
+	uint32_t idx_rx = 0;
 	size_t nh_off;
 	__u16 h_proto;
 
 	rcvd = xsk_ring_cons__peek(&xdp_->rx, vlen, &idx_rx);
 	if (!rcvd) {
-		errno = EAGAIN; // mvfst treats as "try later"
-		return -1;
+	  complete_func(getXsk());
+	  errno = EAGAIN; // mvfst treats as "try later"
+	  return -1;
 	}
 	
 	for (unsigned i = 0; i < rcvd; i++) {
@@ -302,17 +326,18 @@ int XdpSocket::recvmmsg(struct mmsghdr* msgvec, unsigned int vlen, unsigned int 
 		uint8_t* pkt = (uint8_t*)xsk_umem__get_data(xdp_->umem->buffer, d->addr);
 
 		// recycle the frame
+		// TODO check it
 		xsk_free_umem_frame(xdp_.get(), d->addr);
 		
 		struct ethhdr *eth = (struct ethhdr *) pkt;
 		nh_off = ETH_HLEN;
 		h_proto = eth->h_proto;
 		if (h_proto == htons(ETH_P_8021Q) || h_proto == htons(ETH_P_8021AD)) {
-  	  struct _vlan_hdr *vhdr;
-  	  vhdr = (struct _vlan_hdr *)(pkt + nh_off);
-  	  nh_off += sizeof(struct _vlan_hdr);
-  	  h_proto = vhdr->h_vlan_encapsulated_proto;
-  	}
+  	  	  struct _vlan_hdr *vhdr;
+  	      vhdr = (struct _vlan_hdr *)(pkt + nh_off);
+  	      nh_off += sizeof(struct _vlan_hdr);
+  	      h_proto = vhdr->h_vlan_encapsulated_proto;
+  		}
 		struct iphdr *iph = (struct iphdr *) (pkt + nh_off);
 		nh_off += iph->ihl * 4;
 		struct udphdr *udp = (struct udphdr *) (pkt + nh_off);
@@ -344,29 +369,19 @@ int XdpSocket::recvmmsg(struct mmsghdr* msgvec, unsigned int vlen, unsigned int 
 		msgvec[i].msg_len = n;
 
 		if (mh.msg_name && mh.msg_namelen >= sizeof(sockaddr_in)) {
-  	  auto* sin = (struct sockaddr_in*)mh.msg_name;
-  	  sin->sin_family = AF_INET;
-  	  sin->sin_addr.s_addr = iph->saddr;   // already network order
-  	  sin->sin_port = udp->source;         // already network order
-  	  mh.msg_namelen = sizeof(sockaddr_in);
-  	}
-  	mh.msg_controllen = 0;   // no GRO/cmsg for the first cut
-  	mh.msg_flags = 0;
+  		  auto* sin = (struct sockaddr_in*)mh.msg_name;
+  		  sin->sin_family = AF_INET;
+  		  sin->sin_addr.s_addr = iph->saddr;   // already network order
+  		  sin->sin_port = udp->source;         // already network order
+  		  mh.msg_namelen = sizeof(sockaddr_in);
+  		}
+  		mh.msg_controllen = 0;   // no GRO/cmsg for the first cut
+  		mh.msg_flags = 0;
 	}
 
 	xsk_ring_cons__release(&xdp_->rx, rcvd);
-	unsigned nfree = xsk_umem_free_frames(xdp_.get());
-	unsigned room = xsk_prod_nb_free(&xdp_->umem->fq, nfree);
-	unsigned stock = std::min(room, nfree);
-	if (stock > 0) {
-		xsk_ring_prod__reserve(&xdp_->umem->fq, stock, &idx_fq);
-		for (unsigned j = 0; j < stock; j++)
-      *xsk_ring_prod__fill_addr(&xdp_->umem->fq, idx_fq + j) = xsk_alloc_umem_frame(xdp_.get());
-    xsk_ring_prod__submit(&xdp_->umem->fq, stock);
-	}
-	if (xsk_ring_prod__needs_wakeup(&xdp_->umem->fq))
-    recvfrom(xsk_socket__fd(xdp_->xsk), NULL, 0, MSG_DONTWAIT, NULL, NULL);
-	
+	complete_func(getXsk());
+
 	return rcvd;
 }
 
@@ -382,6 +397,8 @@ void XdpSocket::resumeRead(folly::AsyncUDPSocket::ReadCallback* cob) {
 	if (!is_registered) {
 		XLOG(WARNING) << "Can't register the new handler";
 	}
+
+	recvfrom(xsk_socket__fd(xdp_->xsk), NULL, 0, MSG_DONTWAIT, NULL, NULL);
 }
 
 ssize_t XdpSocket::writev(const folly::SocketAddress& address, const struct iovec* vec, size_t iovec_len, folly::AsyncUDPSocket::WriteOptions options) {
@@ -413,6 +430,11 @@ ssize_t XdpSocket::writev(const folly::SocketAddress& address, const struct iove
 	for (size_t off = 0; off < payload_len; off += seg_size) {
 		// This is to make sure that the last one sized correctly
 		size_t seg_len = std::min(seg_size, payload_len - off);
+		
+		if (xsk_umem_free_frames(x) <= RX_FRAME_FLOOR) {
+        	complete_tx(x); // reclaim finished TX frames, retry once
+        	if (xsk_umem_free_frames(x) <= RX_FRAME_FLOOR) break; // still dry, stop
+        }
 
 		uint64_t frame = xsk_alloc_umem_frame(x);
 		if (frame == INVALID_UMEM_FRAME) {
@@ -421,7 +443,7 @@ ssize_t XdpSocket::writev(const folly::SocketAddress& address, const struct iove
 			if (frame == INVALID_UMEM_FRAME) break; // still dry, stop
 		}
 		uint8_t* pkt = (uint8_t*)xsk_umem__get_data(x->umem->buffer, frame);
-    //   4. build eth/ip/udp headers into pkt   (dstMac, x->local_mac, peerIp, dstPort ...)
+    	//   4. build eth/ip/udp headers into pkt   (dstMac, x->local_mac, peerIp, dstPort ...)
 		ssize_t hdr_len = 42; // 14 (eth) + 20 (ip) + 8 (udp)
 		// datagram must fit into FRAME SIZE (4096)
 		if (hdr_len + seg_len > FRAME_SIZE) { xsk_free_umem_frame(x, frame); break;}
@@ -467,8 +489,8 @@ ssize_t XdpSocket::writev(const folly::SocketAddress& address, const struct iove
 		sent += seg_len;
 	}
 	// Stage 8 wakeup + Stage 9 completion drain, then:
-	if (xsk_ring_prod__needs_wakeup(&x->tx)) 
-			sendto(xsk_socket__fd(x->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+	//if (xsk_ring_prod__needs_wakeup(&x->tx)) 
+		sendto(xsk_socket__fd(x->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
 	complete_tx(x);
 	if (sent == 0) { errno = EAGAIN; return -1; }
 	return sent;
