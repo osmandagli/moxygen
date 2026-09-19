@@ -24,8 +24,13 @@
 #include <netinet/udp.h> 
 #include <sys/socket.h>
 
-#define RX_FRAME_FLOOR 512
-#define NUM_FRAMES  4096
+// UMEM is split in two pools so RX can never starve TX (and vice versa).
+// RX: frames [0, NUM_RX_FRAMES) circulate only between fill ring, NIC and rx ring.
+//     ice pre-posts a whole HW ring (2047) and the fill ring holds 2048 more.
+// TX: frames [NUM_RX_FRAMES, NUM_FRAMES) circulate only between tx ring and cq.
+#define NUM_RX_FRAMES 4096
+#define NUM_TX_FRAMES 4096
+#define NUM_FRAMES  (NUM_RX_FRAMES + NUM_TX_FRAMES)
 #define FRAME_SIZE  XSK_UMEM__DEFAULT_FRAME_SIZE
 #define INVALID_UMEM_FRAME UINT64_MAX
 
@@ -52,7 +57,10 @@ struct xsk_socket_info {
 
   struct xsk_socket* xsk = nullptr;
 	
-  std::vector<uint64_t> umem_frame_addr; // Unused UMEM frames
+  std::vector<uint64_t> rx_free; // RX frames owned by userspace, to go back to fq
+  std::vector<uint64_t> tx_free; // TX frames available for writev
+
+  uint64_t tx_fallback_pkts = 0; // segments sent via kernel because XSK TX was full
 
   int queueId = -1;
 	int ifindex = -1;
@@ -66,6 +74,18 @@ struct xsk_socket_info {
 
 	// per-peer next-hop MAC, keyed by peer IPv4 (net order). 
 	folly::F14FastMap<uint32_t, std::array<uint8_t, 6>> peer_macs;
+
+	struct Stats {
+		uint64_t tx_calls = 0, tx_segs_asked = 0, tx_segs_sent = 0, tx_completed = 0;
+		uint64_t tx_fallback = 0, tx_floor_break = 0, tx_alloc_fail = 0;
+		uint64_t tx_too_big = 0, tx_ring_full = 0, tx_short = 0, tx_eagain = 0;
+		uint64_t tx_kick_err = 0, tx_bad_desc = 0;
+		uint64_t rx_pkts = 0, rx_short = 0, rx_trunc = 0;
+		uint64_t fq_reserve_fail = 0, dup_free = 0;
+    } st;
+    uint64_t ticks = 0;
+    std::vector<uint8_t> in_pool = std::vector<uint8_t>(NUM_FRAMES, 0); // 1 = chunk sits in umem_frame_addr
+    folly::F14FastMap<uint16_t, uint32_t> tx_trace;
 
 	~xsk_socket_info() {
 		if (ifindex > 0) bpf_xdp_detach(ifindex, XDP_FLAGS_DRV_MODE, NULL);
@@ -99,18 +119,19 @@ xsk_umem_info *configure_xsk_umem(void *buffer, uint64_t size)
 	return umem;
 }
 
-void     xsk_free_umem_frame(xsk_socket_info* xsk, uint64_t addr) { xsk->umem_frame_addr.push_back(addr); }
+// RX descriptors carry frame base + headroom offset; strip it back to the frame base
+inline uint64_t frame_base(uint64_t addr) { return addr & ~((uint64_t)FRAME_SIZE - 1); }
 
-uint64_t xsk_umem_free_frames(xsk_socket_info* xsk) { return xsk->umem_frame_addr.size(); }
+void     xsk_free_frame(std::vector<uint64_t>& pool, uint64_t addr) { pool.push_back(frame_base(addr)); }
 
-uint64_t xsk_alloc_umem_frame(xsk_socket_info *xsk)
+uint64_t xsk_alloc_frame(std::vector<uint64_t>& pool)
 {
 	uint64_t frame;
-	if (xsk->umem_frame_addr.empty())
+	if (pool.empty())
 		return INVALID_UMEM_FRAME;
 
-	frame = xsk->umem_frame_addr.back();
-	xsk->umem_frame_addr.pop_back();
+	frame = pool.back();
+	pool.pop_back();
 	return frame;
 }
 
@@ -137,8 +158,11 @@ bool xsk_configure_socket(xsk_socket_info* xsk_info, const char* ifname, int que
 		goto errno_exit;
 	}
 
-	for(i=0; i < NUM_FRAMES; i++) {
-		xsk_info->umem_frame_addr.push_back(i * FRAME_SIZE);
+	for(i=0; i < NUM_RX_FRAMES; i++) {
+		xsk_info->rx_free.push_back((uint64_t)i * FRAME_SIZE);
+	}
+	for(i=NUM_RX_FRAMES; i < NUM_FRAMES; i++) {
+		xsk_info->tx_free.push_back((uint64_t)i * FRAME_SIZE);
 	}
 
 	// Reserve space for fill ring
@@ -149,7 +173,7 @@ bool xsk_configure_socket(xsk_socket_info* xsk_info, const char* ifname, int que
 
 	// Populate the fill ring with addrs
 	for(i=0; i < XSK_RING_PROD__DEFAULT_NUM_DESCS; i++) {
-		*xsk_ring_prod__fill_addr(&xsk_info->umem->fq, idx++) = xsk_alloc_umem_frame(xsk_info);
+		*xsk_ring_prod__fill_addr(&xsk_info->umem->fq, idx++) = xsk_alloc_frame(xsk_info->rx_free);
 	}
 
 	// Submit the filled slots to the kernel to process them
@@ -169,7 +193,7 @@ void complete_tx(xsk_socket_info* x) {
 	if (!completed) return;
 
 	for (unsigned i = 0; i < completed; i++) {
-		xsk_free_umem_frame(x, *xsk_ring_cons__comp_addr(&x->umem->cq, idx_cq + i));
+		xsk_free_frame(x->tx_free, *xsk_ring_cons__comp_addr(&x->umem->cq, idx_cq + i));
 	}
 	xsk_ring_cons__release(&x->umem->cq, completed);
 }
@@ -179,13 +203,13 @@ void complete_func(xsk_socket_info* x) {
 
 	complete_tx(x);
 
-	unsigned nfree = xsk_umem_free_frames(x);
+	unsigned nfree = x->rx_free.size();
 	unsigned room = xsk_prod_nb_free(&x->umem->fq, nfree);
 	unsigned stock = std::min(room, nfree);
 	if (stock > 0) {
 		xsk_ring_prod__reserve(&x->umem->fq, stock, &idx_fq);
 		for (unsigned j = 0; j < stock; j++)
-      		*xsk_ring_prod__fill_addr(&x->umem->fq, idx_fq + j) = xsk_alloc_umem_frame(x);
+      		*xsk_ring_prod__fill_addr(&x->umem->fq, idx_fq + j) = xsk_alloc_frame(x->rx_free);
     xsk_ring_prod__submit(&x->umem->fq, stock);
 	}
 
@@ -325,9 +349,9 @@ int XdpSocket::recvmmsg(struct mmsghdr* msgvec, unsigned int vlen, unsigned int 
 		const struct xdp_desc* d = xsk_ring_cons__rx_desc(&xdp_->rx, idx_rx + i);
 		uint8_t* pkt = (uint8_t*)xsk_umem__get_data(xdp_->umem->buffer, d->addr);
 
-		// recycle the frame
-		// TODO check it
-		xsk_free_umem_frame(xdp_.get(), d->addr);
+		// recycle the frame; safe because it only goes back to the fill ring in
+		// complete_func() below, after the payload has been copied out
+		xsk_free_frame(xdp_->rx_free, d->addr);
 		
 		struct ethhdr *eth = (struct ethhdr *) pkt;
 		nh_off = ETH_HLEN;
@@ -432,27 +456,25 @@ ssize_t XdpSocket::writev(const folly::SocketAddress& address, const struct iove
 
 	size_t seg_size = options.gso > 0 ? (size_t)options.gso : payload_len;
 	size_t sent = 0;
+	size_t off = 0;
 
-	for (size_t off = 0; off < payload_len; off += seg_size) {
+	for (; off < payload_len; off += seg_size) {
 		// This is to make sure that the last one sized correctly
 		size_t seg_len = std::min(seg_size, payload_len - off);
-		
-		if (xsk_umem_free_frames(x) <= RX_FRAME_FLOOR) {
-        	complete_tx(x); // reclaim finished TX frames, retry once
-        	if (xsk_umem_free_frames(x) <= RX_FRAME_FLOOR) break; // still dry, stop
-        }
 
-		uint64_t frame = xsk_alloc_umem_frame(x);
-		if (frame == INVALID_UMEM_FRAME) {
-			complete_tx(x); // reclaim finished TX frames, retry once
-			frame = xsk_alloc_umem_frame(x);
-			if (frame == INVALID_UMEM_FRAME) break; // still dry, stop
-		}
-		uint8_t* pkt = (uint8_t*)xsk_umem__get_data(x->umem->buffer, frame);
-    	//   4. build eth/ip/udp headers into pkt   (dstMac, x->local_mac, peerIp, dstPort ...)
 		ssize_t hdr_len = 42; // 14 (eth) + 20 (ip) + 8 (udp)
 		// datagram must fit into FRAME SIZE (4096)
-		if (hdr_len + seg_len > FRAME_SIZE) { xsk_free_umem_frame(x, frame); break;}
+		if (hdr_len + seg_len > FRAME_SIZE) break;
+
+		// need both a free TX frame and a TX ring slot
+		if (x->tx_free.empty() || xsk_prod_nb_free(&x->tx, 1) < 1) {
+			complete_tx(x); // reclaim finished TX frames, retry once
+			if (x->tx_free.empty() || xsk_prod_nb_free(&x->tx, 1) < 1) break; // still full
+		}
+
+		uint64_t frame = xsk_alloc_frame(x->tx_free);
+		uint8_t* pkt = (uint8_t*)xsk_umem__get_data(x->umem->buffer, frame);
+    	//   4. build eth/ip/udp headers into pkt   (dstMac, x->local_mac, peerIp, dstPort ...)
 
 		struct ethhdr* eth = (struct ethhdr*) pkt;
 		memcpy(eth->h_dest, dst_mac.data(), 6); // peer, next hop
@@ -485,7 +507,7 @@ ssize_t XdpSocket::writev(const folly::SocketAddress& address, const struct iove
     //   7. reserve TX desc: addr, len = 42 + segLen; submit
 		uint32_t tx_idx = 0;
 		if (xsk_ring_prod__reserve(&x->tx, 1, &tx_idx) != 1) {
-			xsk_free_umem_frame(x, frame); // couldn't queue stop
+			xsk_free_frame(x->tx_free, frame); // couldn't queue stop
 			break;
 		}
 		struct xdp_desc* txd = xsk_ring_prod__tx_desc(&x->tx, tx_idx);
@@ -496,9 +518,22 @@ ssize_t XdpSocket::writev(const folly::SocketAddress& address, const struct iove
 	}
 	// Stage 8 wakeup + Stage 9 completion drain, then:
 	//if (xsk_ring_prod__needs_wakeup(&x->tx)) 
+	if (sent > 0)
 		sendto(xsk_socket__fd(x->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
 	complete_tx(x);
-	if (sent == 0) { errno = EAGAIN; return -1; }
+
+	// Never drop the rest of a batch: whatever didn't fit in XSK TX goes out
+	// through the kernel socket (same fd, same 4-tuple), keeping GSO.
+	if (off < payload_len) {
+		x->tx_fallback_pkts += (payload_len - off + seg_size - 1) / seg_size;
+		XLOG_EVERY_MS(WARNING, 1000) << "XSK TX full, kernel fallback segments so far="
+		                             << x->tx_fallback_pkts
+		                             << " tx_free=" << x->tx_free.size();
+		struct iovec rest = {(uint8_t*)vec[0].iov_base + off, payload_len - off};
+		ssize_t r = folly::AsyncUDPSocket::writev(address, &rest, 1, options);
+		if (r < 0) return sent > 0 ? (ssize_t)sent : r;
+		sent += r;
+	}
 	return sent;
 }
 
