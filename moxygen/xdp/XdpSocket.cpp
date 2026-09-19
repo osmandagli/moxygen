@@ -190,7 +190,7 @@ void complete_func(xsk_socket_info* x) {
 	}
 
 	if (xsk_ring_prod__needs_wakeup(&x->umem->fq))
-	//TODO add poll()
+		//TODO add poll()
     	recvfrom(xsk_socket__fd(x->xsk), NULL, 0, MSG_DONTWAIT, NULL, NULL);
 }
 
@@ -397,6 +397,12 @@ void XdpSocket::resumeRead(folly::AsyncUDPSocket::ReadCallback* cob) {
 	if (!is_registered) {
 		XLOG(WARNING) << "Can't register the new handler";
 	}
+
+	rxKick_ = folly::AsyncTimeout::make(*getEventBase(), [this]() noexcept {
+	  complete_func(xdp_.get());
+	  rxKick_->scheduleTimeout(1);   // ms; re-arm
+	});
+	rxKick_->scheduleTimeout(1);
 
 	recvfrom(xsk_socket__fd(xdp_->xsk), NULL, 0, MSG_DONTWAIT, NULL, NULL);
 }

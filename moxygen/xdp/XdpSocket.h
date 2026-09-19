@@ -35,6 +35,7 @@ class XdpSocket : public folly::AsyncUDPSocket {
     std::unique_ptr<xsk_socket_info> xdp_;
     xsk_socket_info* sharedXsk_ = nullptr;
     bool ownsXsk_;
+    std::unique_ptr<folly::AsyncTimeout> rxKick_;
 };
 
 struct XskShared { xsk_socket_info* xsk = nullptr; };
