@@ -9,6 +9,7 @@
 #include <folly/String.h>
 #include <folly/logging/xlog.h>
 #include <folly/net/NetOps.h>
+#include <folly/portability/GFlags.h>
 #include <proxygen/httpserver/samples/hq/FizzContext.h>
 #include <proxygen/lib/http/session/HQSession.h>
 #include <proxygen/lib/http/webtransport/HTTPWebTransport.h>
@@ -23,6 +24,8 @@
 
 using namespace quic::samples;
 using namespace proxygen;
+
+DEFINE_bool(use_xdp, false, "Use AF_XDP sockets for the QUIC UDP data path");
 
 namespace moxygen {
 
@@ -127,11 +130,16 @@ MoQServer::MoQServer(
   hqServer_ =
       std::make_unique<HQServer>(params_, std::move(factory_), fizzContext_);
   
-  auto shared = std::make_shared<XskShared>();
-  auto listenerFactory = std::make_unique<XdpSocketFactory>(shared);
-  auto connFactory = std::make_unique<XdpSocketFactory>(shared);
+  if (FLAGS_use_xdp) {
+    XLOG(INFO) << "MoQServer: AF_XDP data path enabled";
+    auto shared = std::make_shared<XskShared>();
+    hqServer_->setQuicUDPSocketFactories(
+        std::make_unique<XdpSocketFactory>(shared),
+        std::make_unique<XdpSocketFactory>(shared));
+  } else {
+    XLOG(INFO) << "MoQServer: using standard UDP sockets";
+  }
 
-  hqServer_->setQuicUDPSocketFactories(std::move(listenerFactory), std::move(connFactory));
 
 }
 

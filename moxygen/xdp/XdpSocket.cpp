@@ -4,6 +4,7 @@
 #include <folly/io/async/AsyncUDPSocket.h>
 #include <folly/net/NetOps.h>
 #include <folly/container/F14Map.h>
+#include <folly/portability/GFlags.h>
 
 #include <memory>
 #include <vector>
@@ -34,6 +35,13 @@
 #define NUM_FRAMES  (NUM_RX_FRAMES + NUM_TX_FRAMES)
 #define FRAME_SIZE  XSK_UMEM__DEFAULT_FRAME_SIZE
 #define INVALID_UMEM_FRAME UINT64_MAX
+
+DEFINE_string(xdp_ifname, "eno12409np1", "NIC for the AF_XDP socket");
+DEFINE_int32(xdp_queue, 2, "NIC RX queue to bind the AF_XDP socket to");
+DEFINE_string(
+      xdp_bpf_obj,
+      "/local/moxygen_build/repos/github.com-facebookexperimental-moxygen.git/moxygen/xdp/XdpKernel.bpf.o",
+      "Path to the compiled XDP kernel object");
 
 namespace moxygen {
 
@@ -255,7 +263,7 @@ XdpSocket::XdpSocket(folly::EventBase* evb, bool ownsXsk) : folly::AsyncUDPSocke
 		throw std::runtime_error("ERROR: Can't create umem");
 	}
 
-	int ifindex = if_nametoindex("enp23s0f0np0");
+	int ifindex = if_nametoindex(FLAGS_xdp_ifname.c_str());
 	if (ifindex == 0) {
 		fprintf(stderr, "ERROR: Can't find the interface \"%s\"\n",
 			strerror(errno));
@@ -263,7 +271,7 @@ XdpSocket::XdpSocket(folly::EventBase* evb, bool ownsXsk) : folly::AsyncUDPSocke
 	}
 	xdp_->ifindex = ifindex;
 
-	bpf_object* obj = bpf_object__open_file("/local/moxygen_build/repos/github.com-facebookexperimental-moxygen.git/moxygen/xdp/XdpKernel.bpf.o", NULL);
+	bpf_object* obj = bpf_object__open_file(FLAGS_xdp_bpf_obj.c_str(), NULL);
 	if (obj == NULL) {
 		fprintf(stderr, "ERROR: Can't open bpf object \"%s\"\n",
 			strerror(errno));
@@ -299,7 +307,7 @@ XdpSocket::XdpSocket(folly::EventBase* evb, bool ownsXsk) : folly::AsyncUDPSocke
 		throw std::runtime_error("ERROR: Unvalid map_fd");
 	}
 
-	ret = xsk_configure_socket(xdp_.get(), "enp23s0f0np0", 2);
+	ret = xsk_configure_socket(xdp_.get(), FLAGS_xdp_ifname.c_str(), FLAGS_xdp_queue);
 	if (ret) {
 		fprintf(stderr, "ERROR: Can't create socket \"%s\"\n",
 			strerror(errno));
