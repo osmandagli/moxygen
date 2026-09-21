@@ -1,4 +1,5 @@
 #include "moxygen/xdp/XdpSocket.h"
+#include <folly/io/async/AsyncTimeout.h>
 #include <folly/io/async/EventBase.h>
 #include <folly/io/async/AsyncUDPSocket.h>
 #include <folly/net/NetOps.h>
@@ -74,18 +75,6 @@ struct xsk_socket_info {
 
 	// per-peer next-hop MAC, keyed by peer IPv4 (net order). 
 	folly::F14FastMap<uint32_t, std::array<uint8_t, 6>> peer_macs;
-
-	struct Stats {
-		uint64_t tx_calls = 0, tx_segs_asked = 0, tx_segs_sent = 0, tx_completed = 0;
-		uint64_t tx_fallback = 0, tx_floor_break = 0, tx_alloc_fail = 0;
-		uint64_t tx_too_big = 0, tx_ring_full = 0, tx_short = 0, tx_eagain = 0;
-		uint64_t tx_kick_err = 0, tx_bad_desc = 0;
-		uint64_t rx_pkts = 0, rx_short = 0, rx_trunc = 0;
-		uint64_t fq_reserve_fail = 0, dup_free = 0;
-    } st;
-    uint64_t ticks = 0;
-    std::vector<uint8_t> in_pool = std::vector<uint8_t>(NUM_FRAMES, 0); // 1 = chunk sits in umem_frame_addr
-    folly::F14FastMap<uint16_t, uint32_t> tx_trace;
 
 	~xsk_socket_info() {
 		if (ifindex > 0) bpf_xdp_detach(ifindex, XDP_FLAGS_DRV_MODE, NULL);
@@ -266,7 +255,7 @@ XdpSocket::XdpSocket(folly::EventBase* evb, bool ownsXsk) : folly::AsyncUDPSocke
 		throw std::runtime_error("ERROR: Can't create umem");
 	}
 
-	int ifindex = if_nametoindex("eno12409np1");
+	int ifindex = if_nametoindex("enp23s0f0np0");
 	if (ifindex == 0) {
 		fprintf(stderr, "ERROR: Can't find the interface \"%s\"\n",
 			strerror(errno));
@@ -310,7 +299,7 @@ XdpSocket::XdpSocket(folly::EventBase* evb, bool ownsXsk) : folly::AsyncUDPSocke
 		throw std::runtime_error("ERROR: Unvalid map_fd");
 	}
 
-	ret = xsk_configure_socket(xdp_.get(), "eno12409np1", 2);
+	ret = xsk_configure_socket(xdp_.get(), "enp23s0f0np0", 2);
 	if (ret) {
 		fprintf(stderr, "ERROR: Can't create socket \"%s\"\n",
 			strerror(errno));
