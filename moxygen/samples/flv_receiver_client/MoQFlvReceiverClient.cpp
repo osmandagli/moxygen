@@ -5,6 +5,8 @@
  */
 
 #include <folly/portability/GFlags.h>
+#include <chrono>
+#include <cstdio>
 #include <iostream>
 #include "moxygen/MoQClient.h"
 #include "moxygen/MoQWebTransportClient.h"
@@ -52,9 +54,31 @@ DEFINE_bool(
     insecure,
     false,
     "Use insecure verifier (skip certificate validation)");
+DEFINE_string(
+    latency_csv,
+    "",
+    "Write one row per received object to this file (empty = off). "
+    "Columns: recv_us,type,seq_id,wallclock_us,latency_us");
 
 namespace {
 using namespace moxygen;
+
+// Opened once on first use; null when --latency_csv is not set.
+FILE* latencyCsv() {
+  static FILE* csv = [] {
+    if (FLAGS_latency_csv.empty()) {
+      return static_cast<FILE*>(nullptr);
+    }
+    FILE* f = ::fopen(FLAGS_latency_csv.c_str(), "w");
+    if (f) {
+      ::fprintf(f, "recv_us,type,seq_id,wallclock_us,latency_us\n");
+    } else {
+      XLOG(ERR) << "Can't open --latency_csv=" << FLAGS_latency_csv;
+    }
+    return f;
+  }();
+  return csv;
+}
 
 class TrackType {
  public:
@@ -127,6 +151,23 @@ class TrackReceiverHandler : public ObjectReceiverCallback {
           std::make_unique<MoQMi::MoqMiObject>(
               objHeader.extensions.getMutableExtensions(), std::move(payload)));
       logData(payloadDecodedData);
+      // Latency is sampled here, before the dejitter buffer adds its delay.
+      if (auto* csv = latencyCsv()) {
+        if (auto wallclockUs = getWallclock(payloadDecodedData)) {
+          auto nowUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+          ::fprintf(
+              csv,
+              "%lld,%s,%llu,%llu,%lld\n",
+              static_cast<long long>(nowUs),
+              trackMediaType_.toStr().c_str(),
+              static_cast<unsigned long long>(
+                  getSeqId(payloadDecodedData).value_or(0)),
+              static_cast<unsigned long long>(*wallclockUs),
+              static_cast<long long>(nowUs - static_cast<int64_t>(*wallclockUs)));
+        }
+      }
       if (payloadDecodedData.index() ==
               MoQMi::MoqMIItemTypeIndex::MOQMI_ITEM_INDEX_VIDEO_H264_AVC ||
           payloadDecodedData.index() ==
@@ -251,6 +292,24 @@ class TrackReceiverHandler : public ObjectReceiverCallback {
       return std::get<MoQMi::MoqMIItemTypeIndex::MOQMI_ITEM_INDEX_AUDIO_AAC_LC>(
                  payloadDecodedData)
           ->seqId;
+    }
+    return std::nullopt;
+  }
+
+  std::optional<uint64_t> getWallclock(
+      const MoQMi::MoqMiItem& payloadDecodedData) const {
+    if (payloadDecodedData.index() ==
+        MoQMi::MoqMIItemTypeIndex::MOQMI_ITEM_INDEX_VIDEO_H264_AVC) {
+      return std::get<
+                 MoQMi::MoqMIItemTypeIndex::MOQMI_ITEM_INDEX_VIDEO_H264_AVC>(
+                 payloadDecodedData)
+          ->wallclock;
+    } else if (
+        payloadDecodedData.index() ==
+        MoQMi::MoqMIItemTypeIndex::MOQMI_ITEM_INDEX_AUDIO_AAC_LC) {
+      return std::get<MoQMi::MoqMIItemTypeIndex::MOQMI_ITEM_INDEX_AUDIO_AAC_LC>(
+                 payloadDecodedData)
+          ->wallclock;
     }
     return std::nullopt;
   }

@@ -29,9 +29,10 @@ std::unique_ptr<FlvStreamParser::MediaItem> FlvStreamParser::parse(
 
   // Set FLV timebase
   localItem->timescale = kFlvTimeScale;
-  // Set wallclock here (NOT exact, but close enough in real live video)
+  // Set wallclock here (NOT exact, but close enough in real live video).
+  // Microseconds: used as the send timestamp for end-to-end latency measurement.
   localItem->wallclock =
-      std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
           std::chrono::system_clock::now().time_since_epoch())
           .count();
 
