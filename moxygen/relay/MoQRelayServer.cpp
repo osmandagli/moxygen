@@ -48,6 +48,10 @@ DEFINE_bool(
     false,
     "Listen on QMUX-on-TCP (TLS via Fizz is mandatory). May be combined with "
     "--quic for dual-stack.");
+DEFINE_int64(
+    udp_buffer_bytes,
+    0,
+    "UDP SO_SNDBUF/SO_RCVBUF request; 0 = moxygen default (1 MiB)");
 
 namespace {
 using namespace moxygen;
@@ -118,7 +122,10 @@ int main(int argc, char* argv[]) {
         relay,
         std::move(fizzContext),
         FLAGS_endpoint,
-        MoQServer::Options{.transportSettings = ts});
+        MoQServer::Options{
+          .transportSettings = ts,
+          .udpSendBufferBytes = static_cast<size_t>(FLAGS_udp_buffer_bytes),
+          .udpRecvBufferBytes = static_cast<size_t>(FLAGS_udp_buffer_bytes)});
     servers.push_back(quicServer);
   }
 
